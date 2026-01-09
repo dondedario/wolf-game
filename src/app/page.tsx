@@ -34,13 +34,30 @@ export default function HomePage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId, name }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to create game');
+
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch (parseErr: any) {
+        // This is where errors like "Unexpected token < in JSON at position 0" would surface
+        const message =
+          parseErr?.message && typeof parseErr.message === 'string'
+            ? `Response parse error: ${parseErr.message}`
+            : 'Failed to parse server response. Check console/network tabs.';
+        console.error('Failed to parse /api/games response as JSON', parseErr);
+        setError(message);
+        return;
+      }
+
+      if (!res.ok) {
+        throw new Error(data?.error || 'Failed to create game');
+      }
 
       localStorage.setItem('playerId', data.player.id);
       router.push(`/game/${data.game.code}`);
     } catch (e: any) {
-      setError(e.message || 'Something went wrong');
+      console.error('Error while hosting game', e);
+      setError(e?.message || 'Something went wrong while creating the game');
     } finally {
       setLoading(false);
     }
@@ -50,18 +67,51 @@ export default function HomePage() {
     if (!name || !code || !userId) return;
     setLoading(true);
     setError(null);
+
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/479a9dd2-8a0d-46ff-bb39-693caa23b71b', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: 'debug-session',
+        runId: 'pre-fix-join',
+        hypothesisId: 'H1',
+        location: 'src/app/page.tsx:handleJoin:entry',
+        message: 'handleJoin called',
+        data: { hasName: !!name, hasCode: !!code, hasUserId: !!userId },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
+
     try {
       const res = await fetch('/api/games/join', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId, name, code }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to join game');
+
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch (parseErr: any) {
+        const message =
+          parseErr?.message && typeof parseErr.message === 'string'
+            ? `Join response parse error: ${parseErr.message}`
+            : 'Failed to parse join response. Check console/network tabs.';
+        console.error('Failed to parse /api/games/join response as JSON', parseErr);
+        setError(message);
+        return;
+      }
+
+      if (!res.ok) {
+        throw new Error(data?.error || 'Failed to join game');
+      }
 
       localStorage.setItem('playerId', data.player.id);
       router.push(`/game/${data.game.code}`);
     } catch (e: any) {
+      console.error('Error while joining game', e);
       setError(e.message || 'Something went wrong');
     } finally {
       setLoading(false);
