@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { useParams } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
 
@@ -26,12 +26,6 @@ function getUserId(): string {
 }
 
 export default function GamePage() {
-  // #region agent log
-  if (typeof window !== 'undefined') {
-    fetch('http://127.0.0.1:7242/ingest/479a9dd2-8a0d-46ff-bb39-693caa23b71b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'page.tsx:GamePage:init',message:'GamePage component initialized',data:{timestamp:Date.now()},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'A'})}).catch(()=>{});
-  }
-  // #endregion
-
   const params = useParams<{ code: string }>();
   const code = params.code;
   const [game, setGame] = useState<Game | null>(null);
@@ -56,6 +50,20 @@ export default function GamePage() {
     wasProtected: boolean;
   } | null>(null);
   const [submittingAction, setSubmittingAction] = useState(false);
+
+  // Refs to track subscription state and prevent duplicate subscriptions
+  const subscriptionsRef = useRef<{
+    gameChannel: ReturnType<typeof supabase.channel> | null;
+    playersChannel: ReturnType<typeof supabase.channel> | null;
+    nightActionsChannel: ReturnType<typeof supabase.channel> | null;
+  }>({
+    gameChannel: null,
+    playersChannel: null,
+    nightActionsChannel: null,
+  });
+
+  // Ref to store checkNightStatus function so it can be accessed in subscriptions
+  const checkNightStatusRef = useRef<(() => Promise<void>) | null>(null);
 
   useEffect(() => {
     setCurrentUserId(getUserId());
@@ -122,6 +130,17 @@ export default function GamePage() {
   useEffect(() => {
     if (!game?.id) return;
 
+    // Clean up any existing subscriptions first
+    if (subscriptionsRef.current.gameChannel) {
+      supabase.removeChannel(subscriptionsRef.current.gameChannel);
+    }
+    if (subscriptionsRef.current.playersChannel) {
+      supabase.removeChannel(subscriptionsRef.current.playersChannel);
+    }
+    if (subscriptionsRef.current.nightActionsChannel) {
+      supabase.removeChannel(subscriptionsRef.current.nightActionsChannel);
+    }
+
     // Subscribe to game state changes
     const gameChannel = supabase
       .channel(`game-${game.id}`)
@@ -134,86 +153,105 @@ export default function GamePage() {
           filter: `id=eq.${game.id}`,
         },
         (payload) => {
+          console.log('📢 Game state change received:', payload);
           const updatedGame = payload.new as any;
           const newState = updatedGame.phase || updatedGame.game_state || 'lobby';
-          const prevState = game?.game_state || game?.phase || 'lobby';
           
-          setGame((prev) => ({
-            ...prev!,
-            phase: newState,
-            game_state: newState,
-          }));
-
-          // Handle night-to-day transition
-          if (prevState === 'night' && newState === 'day') {
-            // Reset night action state
-            setActionSubmitted(false);
-            setSelectedTargetId(null);
-            setSeerResult(null);
-            setNightStatus(null);
+          setGame((prev) => {
+            const prevState = prev?.game_state || prev?.phase || 'lobby';
             
-            // Reload players to get updated alive status and show who died
-            setTimeout(() => {
-              if (code) {
-                const reload = async () => {
-                  const { data: gameRow } = await supabase
-                    .from('games')
-                    .select('id')
-                    .eq('code', code)
-                    .single();
-                  
-                  if (gameRow) {
-                    const { data: playerRows } = await supabase
-                      .from('players')
-                      .select('id, name, alive, role, user_id')
-                      .eq('game_id', gameRow.id)
-                      .order('joined_at', { ascending: true });
+            // Handle night-to-day transition
+            if (prevState === 'night' && newState === 'day') {
+              // Reset night action state
+              setActionSubmitted(false);
+              setSelectedTargetId(null);
+              setSeerResult(null);
+              setNightStatus(null);
+              
+              // Reload players to get updated alive status and show who died
+              setTimeout(() => {
+                if (code) {
+                  const reload = async () => {
+                    const { data: gameRow } = await supabase
+                      .from('games')
+                      .select('id')
+                      .eq('code', code)
+                      .single();
                     
-                    if (playerRows) {
-                      // Find who died (was alive before, now dead)
-                      const previousPlayers = players.filter((p) => p.alive);
-                      const deadPlayers = playerRows.filter(
-                        (p: any) => !p.alive && previousPlayers.some((prev) => prev.id === p.id && prev.alive)
-                      );
+                    if (gameRow) {
+                      const { data: playerRows } = await supabase
+                        .from('players')
+                        .select('id, name, alive, role, user_id')
+                        .eq('game_id', gameRow.id)
+                        .order('joined_at', { ascending: true });
                       
-                      // Show notification if someone died (if we don't already have night results)
-                      if (deadPlayers.length > 0 && !nightResults) {
-                        setNightResults({
-                          killedPlayerName: deadPlayers[0].name,
-                          wasProtected: false,
+                      if (playerRows) {
+                        setPlayers((currentPlayers) => {
+                          // Find who died (was alive before, now dead)
+                          const previousPlayers = currentPlayers.filter((p) => p.alive);
+                          const deadPlayers = playerRows.filter(
+                            (p: any) => !p.alive && previousPlayers.some((prev) => prev.id === p.id && prev.alive)
+                          );
+                          
+                          // Show notification if someone died (if we don't already have night results)
+                          if (deadPlayers.length > 0) {
+                            setNightResults({
+                              killedPlayerName: deadPlayers[0].name,
+                              wasProtected: false,
+                            });
+                            setTimeout(() => {
+                              setNightResults(null);
+                            }, 5000);
+                          } else {
+                            // No one died
+                            setNightResults({
+                              killedPlayerName: null,
+                              wasProtected: false,
+                            });
+                            setTimeout(() => {
+                              setNightResults(null);
+                            }, 5000);
+                          }
+                          
+                          return playerRows as Player[];
                         });
-                        setTimeout(() => {
-                          setNightResults(null);
-                        }, 5000);
-                      } else if (deadPlayers.length === 0 && !nightResults) {
-                        // No one died
-                        setNightResults({
-                          killedPlayerName: null,
-                          wasProtected: false,
-                        });
-                        setTimeout(() => {
-                          setNightResults(null);
-                        }, 5000);
-                      }
-                      
-                      setPlayers(playerRows as Player[]);
-                      const userId = getUserId();
-                      const currentPlayerData = playerRows.find((p: any) => p.user_id === userId);
-                      if (currentPlayerData) {
-                        setCurrentPlayer(currentPlayerData as Player);
+                        
+                        const userId = getUserId();
+                        const currentPlayerData = playerRows.find((p: any) => p.user_id === userId);
+                        if (currentPlayerData) {
+                          setCurrentPlayer(currentPlayerData as Player);
+                        }
                       }
                     }
-                  }
-                };
-                reload();
-              }
-            }, 500);
-          }
+                  };
+                  reload();
+                }
+              }, 500);
+            }
+            
+            return {
+              ...prev!,
+              phase: newState,
+              game_state: newState,
+            };
+          });
         },
       )
-      .subscribe();
+      .subscribe((status, err) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('✅ Game state subscription active');
+        } else if (status === 'CHANNEL_ERROR') {
+          console.error('❌ Game state subscription error:', err);
+        } else if (status === 'TIMED_OUT') {
+          console.error('⏱️ Game state subscription timed out');
+        } else if (status === 'CLOSED') {
+          console.warn('⚠️ Game state subscription closed');
+        } else {
+          console.log('🔄 Game state subscription status:', status);
+        }
+      });
 
-    // Subscribe to player changes (INSERT, UPDATE for roles)
+    // Subscribe to player changes (INSERT, UPDATE)
     const playersChannel = supabase
       .channel(`players-game-${game.id}`)
       .on(
@@ -225,9 +263,11 @@ export default function GamePage() {
           filter: `game_id=eq.${game.id}`,
         },
         (payload) => {
+          console.log('📢 Player change received:', payload);
           if (payload.eventType === 'INSERT') {
             const newPlayer = payload.new as any;
             setPlayers((prev) => {
+              // Prevent duplicates
               if (prev.some((p) => p.id === newPlayer.id)) {
                 return prev;
               }
@@ -236,12 +276,27 @@ export default function GamePage() {
                 {
                   id: newPlayer.id,
                   name: newPlayer.name,
-                  alive: newPlayer.alive,
+                  alive: newPlayer.alive ?? true,
                   role: newPlayer.role,
                   user_id: newPlayer.user_id,
                 },
-              ];
+              ].sort((a, b) => {
+                // Maintain order by joined_at if available, otherwise by name
+                return a.name.localeCompare(b.name);
+              });
             });
+            
+            // Update current player if it's the new player
+            const userId = getUserId();
+            if (newPlayer.user_id === userId) {
+              setCurrentPlayer({
+                id: newPlayer.id,
+                name: newPlayer.name,
+                alive: newPlayer.alive ?? true,
+                role: newPlayer.role,
+                user_id: newPlayer.user_id,
+              });
+            }
           } else if (payload.eventType === 'UPDATE') {
             const updatedPlayer = payload.new as any;
             setPlayers((prev) =>
@@ -250,7 +305,7 @@ export default function GamePage() {
                   ? {
                       ...p,
                       name: updatedPlayer.name,
-                      alive: updatedPlayer.alive,
+                      alive: updatedPlayer.alive ?? true,
                       role: updatedPlayer.role,
                       user_id: updatedPlayer.user_id,
                     }
@@ -258,19 +313,94 @@ export default function GamePage() {
               )
             );
             // Update current player if it's them
-            if (updatedPlayer.user_id === currentUserId) {
-              setCurrentPlayer(updatedPlayer as Player);
+            const userId = getUserId();
+            if (updatedPlayer.user_id === userId) {
+              setCurrentPlayer({
+                id: updatedPlayer.id,
+                name: updatedPlayer.name,
+                alive: updatedPlayer.alive ?? true,
+                role: updatedPlayer.role,
+                user_id: updatedPlayer.user_id,
+              });
             }
           }
         },
       )
-      .subscribe();
+      .subscribe((status, err) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('✅ Players subscription active');
+        } else if (status === 'CHANNEL_ERROR') {
+          console.error('❌ Players subscription error:', err);
+        } else if (status === 'TIMED_OUT') {
+          console.error('⏱️ Players subscription timed out');
+        } else if (status === 'CLOSED') {
+          console.warn('⚠️ Players subscription closed');
+        } else {
+          console.log('🔄 Players subscription status:', status);
+        }
+      });
+
+    // Subscribe to night actions changes (INSERT, UPDATE)
+    const nightActionsChannel = supabase
+      .channel(`night-actions-${game.id}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'night_actions',
+          filter: `game_id=eq.${game.id}`,
+        },
+        (payload) => {
+          console.log('📢 Night action change received:', payload);
+          // When a night action is added or updated, check the night status
+          // Use a small delay to ensure the database has been updated
+          setTimeout(() => {
+            if (checkNightStatusRef.current) {
+              checkNightStatusRef.current();
+            }
+          }, 100);
+        },
+      )
+      .subscribe((status, err) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('✅ Night actions subscription active');
+        } else if (status === 'CHANNEL_ERROR') {
+          console.error('❌ Night actions subscription error:', err);
+        } else if (status === 'TIMED_OUT') {
+          console.error('⏱️ Night actions subscription timed out');
+        } else if (status === 'CLOSED') {
+          console.warn('⚠️ Night actions subscription closed');
+        } else {
+          console.log('🔄 Night actions subscription status:', status);
+        }
+      });
+
+    // Store channel references
+    subscriptionsRef.current = {
+      gameChannel,
+      playersChannel,
+      nightActionsChannel,
+    };
 
     return () => {
-      supabase.removeChannel(gameChannel);
-      supabase.removeChannel(playersChannel);
+      // Cleanup subscriptions
+      if (subscriptionsRef.current.gameChannel) {
+        supabase.removeChannel(subscriptionsRef.current.gameChannel);
+      }
+      if (subscriptionsRef.current.playersChannel) {
+        supabase.removeChannel(subscriptionsRef.current.playersChannel);
+      }
+      if (subscriptionsRef.current.nightActionsChannel) {
+        supabase.removeChannel(subscriptionsRef.current.nightActionsChannel);
+      }
+      subscriptionsRef.current = {
+        gameChannel: null,
+        playersChannel: null,
+        nightActionsChannel: null,
+      };
     };
-  }, [game?.id, currentUserId]);
+  }, [game?.id, code]);
 
   const handleStartGame = async () => {
     if (!game || !currentUserId) return;
@@ -296,104 +426,7 @@ export default function GamePage() {
     }
   };
 
-  const checkNightStatus = async () => {
-    if (!code || !game) return;
-    const currentGameState = game.game_state || game.phase || 'lobby';
-    if (currentGameState !== 'night') return;
-
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/479a9dd2-8a0d-46ff-bb39-693caa23b71b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'page.tsx:checkNightStatus:entry',message:'checkNightStatus called',data:{hasGame:!!game,hasCode:!!code,currentUserId,gameHostId:game?.host_id},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'A'})}).catch(()=>{});
-    // #endregion
-
-    try {
-      const res = await fetch(`/api/games/${code}/night/status`);
-      const data = await res.json();
-
-      if (res.ok && data) {
-        setNightStatus({
-          allComplete: data.allComplete,
-          completedCount: data.completedCount,
-          totalAlivePlayers: data.totalAlivePlayers,
-        });
-
-        // Compute isHost locally to avoid temporal dead zone issue
-        const isHost = game.host_id === currentUserId;
-
-        // #region agent log
-        fetch('http://127.0.0.1:7242/ingest/479a9dd2-8a0d-46ff-bb39-693caa23b71b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'page.tsx:checkNightStatus:before-autocomplete',message:'Checking if should auto-complete',data:{allComplete:data.allComplete,isHost,currentGameState},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'A'})}).catch(()=>{});
-        // #endregion
-
-        // If all actions are complete and we're the host, auto-complete night
-        if (data.allComplete && isHost && currentGameState === 'night') {
-          handleCompleteNight();
-        }
-      }
-    } catch (e: any) {
-      console.error('Error checking night status:', e);
-      // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/479a9dd2-8a0d-46ff-bb39-693caa23b71b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'page.tsx:checkNightStatus:error',message:'Error in checkNightStatus',data:{error:e?.message},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'A'})}).catch(()=>{});
-      // #endregion
-    }
-  };
-
-  const handleSubmitNightAction = async () => {
-    if (!currentPlayer || !code || submittingAction) return;
-
-    const role = currentPlayer.role;
-    if (!role) return;
-
-    // Villagers don't need a target
-    if (role === 'villager') {
-      // Submit action without target
-    } else if (!selectedTargetId) {
-      setError('Please select a target first');
-      return;
-    }
-
-    setSubmittingAction(true);
-    setError(null);
-
-    try {
-      const res = await fetch(`/api/games/${code}/night/action`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: currentUserId,
-          targetPlayerId: selectedTargetId || null,
-        }),
-      });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to submit action');
-      }
-
-      setActionSubmitted(true);
-
-      // If seer, show the result
-      if (role === 'seer' && data.seerResult && selectedTargetId) {
-        const targetPlayer = players.find((p) => p.id === selectedTargetId);
-        if (targetPlayer) {
-          setSeerResult({
-            targetName: targetPlayer.name,
-            isWerewolf: data.seerResult.isWerewolf,
-          });
-        }
-      }
-
-      // Check night status after submitting
-      setTimeout(() => {
-        checkNightStatus();
-      }, 500);
-    } catch (e: any) {
-      setError(e.message || 'Failed to submit action');
-    } finally {
-      setSubmittingAction(false);
-    }
-  };
-
-  const handleCompleteNight = async () => {
+  const handleCompleteNight = useCallback(async () => {
     if (!code || !currentUserId || !game) return;
     const currentGameState = game.game_state || game.phase || 'lobby';
     if (currentGameState !== 'night') return;
@@ -440,21 +473,122 @@ export default function GamePage() {
         setError(e.message || 'Failed to complete night');
       }
     }
+  }, [code, currentUserId, game]);
+
+  const checkNightStatus = useCallback(async () => {
+    if (!code || !game) return;
+    const currentGameState = game.game_state || game.phase || 'lobby';
+    if (currentGameState !== 'night') return;
+
+    try {
+      const res = await fetch(`/api/games/${code}/night/status`);
+      const data = await res.json();
+
+      if (res.ok && data) {
+        setNightStatus({
+          allComplete: data.allComplete,
+          completedCount: data.completedCount,
+          totalAlivePlayers: data.totalAlivePlayers,
+        });
+
+        // Compute isHost locally to avoid temporal dead zone issue
+        const isHost = game.host_id === currentUserId;
+
+        // If all actions are complete and we're the host, auto-complete night
+        if (data.allComplete && isHost && currentGameState === 'night') {
+          handleCompleteNight();
+        }
+      }
+    } catch (e: any) {
+      console.error('Error checking night status:', e);
+    }
+  }, [code, game, currentUserId, handleCompleteNight]);
+
+  // Update the ref whenever checkNightStatus changes
+  useEffect(() => {
+    checkNightStatusRef.current = checkNightStatus;
+  }, [checkNightStatus]);
+
+  const handleSubmitNightAction = async () => {
+    if (!currentPlayer || !code || submittingAction) return;
+    
+    // Use currentPlayer.user_id as the source of truth, fallback to currentUserId from localStorage
+    const userIdToUse = currentPlayer.user_id || currentUserId;
+    
+    // Ensure we have a valid userId
+    if (!userIdToUse || userIdToUse.trim() === '') {
+      setError('User ID not found. Please refresh the page.');
+      return;
+    }
+
+    const role = currentPlayer.role;
+    if (!role) return;
+
+    // Villagers don't need a target
+    if (role === 'villager') {
+      // Submit action without target
+    } else if (!selectedTargetId) {
+      setError('Please select a target first');
+      return;
+    }
+
+    setSubmittingAction(true);
+    setError(null);
+
+    try {
+      const res = await fetch(`/api/games/${code}/night/action`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: userIdToUse,
+          targetPlayerId: selectedTargetId || null,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to submit action');
+      }
+
+      setActionSubmitted(true);
+
+      // If seer, show the result
+      if (role === 'seer' && data.seerResult && selectedTargetId) {
+        const targetPlayer = players.find((p) => p.id === selectedTargetId);
+        if (targetPlayer) {
+          setSeerResult({
+            targetName: targetPlayer.name,
+            isWerewolf: data.seerResult.isWerewolf,
+          });
+        }
+      }
+
+      // Check night status after submitting
+      setTimeout(() => {
+        checkNightStatus();
+      }, 500);
+    } catch (e: any) {
+      setError(e.message || 'Failed to submit action');
+    } finally {
+      setSubmittingAction(false);
+    }
   };
 
-  // Poll for night status when in night phase
-  useEffect(() => {
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/479a9dd2-8a0d-46ff-bb39-693caa23b71b',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'page.tsx:useEffect:entry',message:'Night status polling useEffect',data:{hasGame:!!game,gameState:game?.game_state,gamePhase:game?.phase,currentPlayerAlive:currentPlayer?.alive,hasCode:!!code},timestamp:Date.now(),sessionId:'debug-session',runId:'pre-fix',hypothesisId:'A'})}).catch(()=>{});
-    // #endregion
 
+  // Poll for night status when in night phase (fallback mechanism)
+  // Primary updates come from real-time subscriptions, this is just a backup
+  useEffect(() => {
     if (!game) return;
     const currentGameState = game.game_state || game.phase || 'lobby';
     if (currentGameState === 'night' && currentPlayer?.alive) {
+      // Initial check
       checkNightStatus();
+      // Fallback polling every 15 seconds (much less frequent than before)
+      // Real-time subscriptions handle most updates
       const interval = setInterval(() => {
         checkNightStatus();
-      }, 2000); // Check every 2 seconds
+      }, 15000); // Check every 15 seconds as fallback
 
       return () => clearInterval(interval);
     }

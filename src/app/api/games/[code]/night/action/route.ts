@@ -41,17 +41,40 @@ export async function POST(
       );
     }
 
+    // Validate userId is not empty
+    if (!userId || userId.trim() === '') {
+      return NextResponse.json(
+        { error: 'Invalid userId provided' },
+        { status: 400 }
+      );
+    }
+
     // Get the current player
-    const { data: player, error: playerError } = await supabase
+    // Handle duplicate players by selecting the most recently joined one (or first if joined_at not available)
+    const { data: players, error: playerError } = await supabase
       .from('players')
       .select('id, role, alive, game_id')
       .eq('game_id', game.id)
       .eq('user_id', userId)
-      .single();
+      .order('joined_at', { ascending: false })
+      .limit(1);
 
-    if (playerError || !player) {
+    if (playerError) {
+      console.error('Error fetching player:', playerError);
       return NextResponse.json(
-        { error: 'Player not found in this game' },
+        { error: 'Failed to fetch player data', details: playerError.message },
+        { status: 500 }
+      );
+    }
+
+    const player = players && players.length > 0 ? players[0] : null;
+
+    if (!player) {
+      return NextResponse.json(
+        { 
+          error: 'Player not found in this game',
+          details: `No player found with userId ${userId} in game ${game.code}`
+        },
         { status: 404 }
       );
     }

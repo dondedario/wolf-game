@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS players (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Set REPLICA IDENTITY for realtime (required for Supabase realtime to work)
+ALTER TABLE players REPLICA IDENTITY FULL;
+
 -- Create night_actions table
 CREATE TABLE IF NOT EXISTS night_actions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

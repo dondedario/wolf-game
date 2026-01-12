@@ -68,22 +68,6 @@ export default function HomePage() {
     setLoading(true);
     setError(null);
 
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/479a9dd2-8a0d-46ff-bb39-693caa23b71b', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: 'debug-session',
-        runId: 'pre-fix-join',
-        hypothesisId: 'H1',
-        location: 'src/app/page.tsx:handleJoin:entry',
-        message: 'handleJoin called',
-        data: { hasName: !!name, hasCode: !!code, hasUserId: !!userId },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
-
     try {
       const res = await fetch('/api/games/join', {
         method: 'POST',
